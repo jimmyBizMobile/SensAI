@@ -13,7 +13,7 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 # --- BOT SETTINGS (EDIT THESE) ---
-ALLOWED_CHANNEL_ID = 1399639548870266981 # <<< PASTE YOUR CHANNEL ID HERE
+ALLOWED_CHANNEL_ID = os.getenv('ALLOWED_CHANNEL_ID')
 MAX_INPUT_LENGTH = 500 # Max characters for user's sentence
 
 # Configure Gemini API and Discord bot intents
