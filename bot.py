@@ -5,6 +5,7 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
+import asyncio
 
 # --- CONFIGURATION ---
 # Load .env file for local testing
@@ -78,7 +79,7 @@ End with a final encouraging message. Format the entire response using clear mar
 async def on_ready():
     print(f'Logged in as {bot.user.name}')
 
-@bot.command(name='check')
+@bot.command(name='check')          
 async def check_japanese_sentence(ctx, *, sentence: str):
     """Checks a Japanese sentence using Gemini."""
     # 1. Check if the command is used in the allowed channel
@@ -93,8 +94,17 @@ async def check_japanese_sentence(ctx, *, sentence: str):
 
     async with ctx.typing():
         try:
+            # Get the current asyncio event loop
+            loop = asyncio.get_running_loop()
             full_prompt = JAPANESE_TUTOR_PROMPT.format(user_sentence=sentence)
-            response = gemini_model.generate_content(full_prompt)
+
+            # Run the synchronous Gemini call in a separate thread
+            response = await loop.run_in_executor(
+                None,  # Use the default thread pool executor
+                gemini_model.generate_content,  # The blocking function to run
+                full_prompt  # The argument to pass to the function
+            )
+            
             feedback = response.text
 
             # 3. Split the response if it's over 2000 characters
