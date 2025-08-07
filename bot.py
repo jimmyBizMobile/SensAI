@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -13,13 +13,19 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
-# --- BOT SETTINGS (EDIT THESE) ---
+# --- BOT SETTINGS ---
 ALLOWED_CHANNEL_ID = int(os.getenv('ALLOWED_CHANNEL_ID'))
+QUIZ_CHANNEL_ID = int(os.getenv("QUIZ_CHANNEL_ID"))
+
 MAX_INPUT_LENGTH = 500 # Max characters for user's sentence
+MAX_RETRIES = 3
+RETRY_DELAY = 2 # Seconds to wait between retries
+
 
 # Configure Gemini API and Discord bot intents
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-2.5-pro')
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
@@ -106,10 +112,116 @@ If applicable, compare the grammar point to a similar one to clarify the differe
 
 Format the entire response using clear markdown and end with an encouraging sentence.
 """
+
+QUIZ_GENERATION_PROMPT = """
+You are a Japanese language teacher creating a quiz question for a student studying for the **JLPT N3 level**.
+Generate a single quiz question based on a common Japanese grammar point or vocabulary word **specifically from the N3 curriculum**.
+
+**IMPORTANT:** Your response MUST be a single line in the following format, using a pipe "|" as a separator:
+Question Text|Correct Answer|Brief Explanation of the tested point
+
+**Example Formats:**
+* Fill in the blank: 「健康のため、毎日運動する＿＿＿しています。」 (Making an effort)|ように|The「〜ようにしています」grammar is used to express making a continuous effort to do something.
+* Translate this sentence to natural Japanese: "It seems the meeting has already started."|会議はもう始まったようです。|The「〜ようです」grammar is used to make a judgment based on sensory information.
+* What is the correct form of the verb?: "This PC is easy to use." (使う)|このパソコンは使いやすいです。|The「〜やすい」grammar is attached to a verb stem to mean "easy to do".
+"""
+
+QUIZ_GRADING_PROMPT = """
+You are a friendly Japanese teacher, SensAI. A student was given a quiz question and has provided an answer. Your task is to grade it.
+
+**The Original Question was:** "{question}"
+**The Correct Answer is:** "{correct_answer}"
+**The Student's Answer is:** "{user_answer}"
+
+**Your Task:**
+1.  Your entire response MUST be in English.
+2.  When you write any Japanese text, you MUST follow it with its romaji in parentheses.
+3.  Start by stating if the student's answer is "Correct!", "Close, but not quite.", or "Incorrect."
+4.  Provide a clear, kind, and simple explanation of why the answer is right or wrong, comparing it to the correct answer.
+5.  End with an encouraging message.
+Format the response using Discord markdown.
+"""
+
+# --- QUIZ STATE MANAGEMENT ---
+current_quiz = {}
+
+# --- TIMED QUIZ TASK ---
+@tasks.loop(hours=2)
+async def post_quiz_question():
+    global current_quiz
+    channel = bot.get_channel(QUIZ_CHANNEL_ID)
+    if not channel:
+        print(f"Error: Quiz channel with ID {QUIZ_CHANNEL_ID} not found.")
+        return
+
+    # --- Retry Logic Starts Here ---
+    for attempt in range(MAX_RETRIES):
+        try:
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(None, gemini_model.generate_content, QUIZ_GENERATION_PROMPT)
+            
+            question, answer, explanation = response.text.strip().split('|')
+
+            current_quiz = { "question": question, "answer": answer, "explanation": explanation }
+
+            await channel.send(f"🧠 **New Japanese Quiz!**\n\n> {question}\n\nType your answer in the chat to respond!")
+            print(f"Posted new quiz successfully. Answer: {answer}")
+            
+            # On success, exit the function immediately.
+            return
+
+        except Exception as e:
+            print(f"Quiz generation attempt {attempt + 1} of {MAX_RETRIES} failed: {e}")
+            if attempt < MAX_RETRIES - 1:  # If this wasn't the last attempt
+                await asyncio.sleep(RETRY_DELAY) # Wait before retrying
+            else: # This was the last attempt, and all have failed.
+                print("All attempts to generate a quiz question failed. The task will try again in the next cycle.")
+
 # --- BOT EVENTS AND COMMANDS ---
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user.name}')
+    if not post_quiz_question.is_running():
+        post_quiz_question.start()
+
+@bot.event
+async def on_message(message):
+    global current_quiz
+    if message.author == bot.user:
+        return
+
+    # --- Logic for the Quiz Channel ---
+    if message.channel.id == QUIZ_CHANNEL_ID:
+        if current_quiz and not message.content.startswith('!'):
+            user_answer = message.content
+            await message.add_reaction('✅')
+            
+            grading_prompt = QUIZ_GRADING_PROMPT.format(
+                question=current_quiz['question'],
+                correct_answer=current_quiz['answer'],
+                user_answer=user_answer
+            )
+
+            for attempt in range(MAX_RETRIES):
+                try:
+                    loop = asyncio.get_running_loop()
+                    response = await loop.run_in_executor(None, gemini_model.generate_content, grading_prompt)
+                    await message.reply(response.text)
+                    current_quiz = {}
+                    print("Quiz graded and reset successfully.")
+                    break
+                except Exception as e:
+                    print(f"Attempt {attempt + 1} of {MAX_RETRIES} failed: {e}")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY)
+                    else:
+                        await message.reply("Sorry, I had trouble grading your answer after multiple attempts.")
+        return
+
+    # --- Logic for the Commands Channel ---
+    if message.channel.id == ALLOWED_CHANNEL_ID:
+        await bot.process_commands(message)
+        return
 
 @bot.command(name='check')          
 async def check_japanese_sentence(ctx, *, sentence: str):
