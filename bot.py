@@ -216,7 +216,7 @@ async def on_message(message):
                     if attempt < MAX_RETRIES - 1:
                         await asyncio.sleep(RETRY_DELAY)
                     else:
-                        await message.reply("Sorry, I had trouble grading your answer after multiple attempts.")
+                        await message.reply("Sorry, I had trouble grading your answer due to a temporary issue. **Please feel free to submit your answer again!**")
         return
 
     # --- Logic for the Commands Channel ---
