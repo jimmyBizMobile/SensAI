@@ -7,6 +7,28 @@ from flask import Flask
 from threading import Thread
 import asyncio
 
+from sqlalchemy import String, Text, func, select
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+# --- DATABASE MODEL SETUP ---
+class Base(DeclarativeBase):
+    pass
+
+class QuizHistory(Base):
+    __tablename__ = "quiz_history"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    grammar_point: Mapped[str] = mapped_column(String(255))
+    question_text: Mapped[str] = mapped_column(Text)
+    correct_answer: Mapped[str] = mapped_column(Text)
+    explanation: Mapped[str] = mapped_column(Text)
+    asked_at: Mapped[str] = mapped_column(
+        Text, 
+        server_default=func.now(), 
+        default=None
+    )
+
 # --- CONFIGURATION ---
 # Load .env file for local testing
 load_dotenv()
@@ -21,6 +43,13 @@ MAX_INPUT_LENGTH = 500 # Max characters for user's sentence
 MAX_RETRIES = 3
 RETRY_DELAY = 2 # Seconds to wait between retries
 
+HISTORY_COUNT = 30
+# Get the database URL from your environment variables
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# Create the async engine and session factory
+engine = create_async_engine(DATABASE_URL)
+async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 # Configure Gemini API and Discord bot intents
 genai.configure(api_key=GEMINI_API_KEY)
@@ -115,15 +144,22 @@ Format the entire response using clear markdown and end with an encouraging sent
 
 QUIZ_GENERATION_PROMPT = """
 You are a Japanese language teacher creating a quiz question for a student studying for the **JLPT N3 level**.
-Generate a single quiz question based on a common Japanese grammar point or vocabulary word **specifically from the N3 curriculum**.
+Generate a single, new quiz question based on a common Japanese grammar point or vocabulary word **specifically from the N3 curriculum**.
 
-**IMPORTANT:** Your response MUST be a single line in the following format, using a pipe "|" as a separator:
-Question Text|Correct Answer|Brief Explanation of the tested point
+**Avoid generating a question related to any of the following topics, as they have been asked recently:**
+{history}
+
+**IMPORTANT:** Your response MUST be a single line in the following format, with FIVE parts separated by a pipe "|":
+Question Text|Question Reading with Furigana|Correct Answer|Specific Grammar Point Tested|Brief Explanation
+
+**"Question Reading with Furigana"** should show the hiragana reading for all kanji, using the format `漢字(かんじ)`.
+
+**The "Specific Grammar Point Tested"** should be a short, identifiable key (e.g., "〜ようにする", "〜ようです", "〜やすい", "〜べき").
 
 **Example Formats:**
-* Fill in the blank: 「健康のため、毎日運動する＿＿＿しています。」 (Making an effort)|ように|The「〜ようにしています」grammar is used to express making a continuous effort to do something.
-* Translate this sentence to natural Japanese: "It seems the meeting has already started."|会議はもう始まったようです。|The「〜ようです」grammar is used to make a judgment based on sensory information.
-* What is the correct form of the verb?: "This PC is easy to use." (使う)|このパソコンは使いやすいです。|The「〜やすい」grammar is attached to a verb stem to mean "easy to do".
+* 「健康のため、毎日運動する＿＿＿しています。」|「健康(けんこう)のため、毎日(まいにち)運動(うんどう)する＿＿＿しています。」|ように|〜ようにする|The「〜ようにしています」grammar is used to express making a continuous effort to do something.
+* "It seems the meeting has already started."|「会議(かいぎ)はもう始(はじ)まったようです。」|会議はもう始まったようです。|〜ようです|The「〜ようです」grammar is used to make a judgment based on sensory information.
+* "This PC is easy to use." (使う)|「このパソコンは使(つか)いやすいです。」|このパソコンは使いやすいです。|〜やすい|The「〜やすい」grammar is attached to a verb stem to mean "easy to do".
 """
 
 QUIZ_GRADING_PROMPT = """
@@ -131,6 +167,7 @@ You are a friendly Japanese teacher, SensAI. A student was given a quiz question
 
 **The Original Question was:** "{question}"
 **The Correct Answer is:** "{correct_answer}"
+**The N3 Grammar Point Tested was:** "{grammar_point}"
 **The Student's Answer is:** "{user_answer}"
 
 **Your Task:**
@@ -138,7 +175,7 @@ You are a friendly Japanese teacher, SensAI. A student was given a quiz question
 2.  When you write any Japanese text, you MUST follow it with its romaji in parentheses.
 3.  **Critically re-evaluate the question.** If the student's answer is also a grammatically correct and natural fit for the blank (even if it's not the one you originally intended), you MUST acknowledge it as a valid alternative before explaining your intended N3-level answer.
 4.  Start by stating if the student's answer is "Correct!", "Also correct!", "Close, but not quite.", or "Incorrect."
-5.  Provide a clear, kind, and simple explanation of why the answer is right or wrong, comparing it to the correct answer.
+5.  Provide a clear, kind, and simple explanation of why the answer is right or wrong, focusing on the intended grammar point: **{grammar_point}**.
 6.  End with an encouraging message.
 Format the response using Discord markdown.
 """
@@ -155,35 +192,77 @@ async def post_quiz_question():
         print(f"Error: Quiz channel with ID {QUIZ_CHANNEL_ID} not found.")
         return
 
-    # --- Retry Logic Starts Here ---
+    # Fetch Recent History using SQLAlchemy
+    recent_topics = "None"
+    try:
+        async with async_session_factory() as session:
+            stmt = (
+                select(QuizHistory.grammar_point)
+                .order_by(QuizHistory.asked_at.desc())
+                .limit(HISTORY_COUNT)
+            )
+            result = await session.execute(stmt)
+            history_list = result.scalars().all()
+            if history_list:
+                recent_topics = ", ".join(history_list)
+    except Exception as e:
+        print(f"Error fetching quiz history via SQLAlchemy: {e}")
+
+    # Generation Logic with Retry
     for attempt in range(MAX_RETRIES):
         try:
+            prompt = QUIZ_GENERATION_PROMPT.format(history=recent_topics)
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(None, gemini_model.generate_content, QUIZ_GENERATION_PROMPT)
+            response = await loop.run_in_executor(None, gemini_model.generate_content, prompt)
             
-            question, answer, explanation = response.text.strip().split('|')
+            question, reading, answer, grammar_point, explanation = map(str.strip, response.text.split('|'))
 
-            current_quiz = { "question": question, "answer": answer, "explanation": explanation }
 
-            await channel.send(f"🧠 **New Japanese Quiz!**\n\n> {question}\n\nType your answer in the chat to respond!")
-            print(f"Posted new quiz successfully. Answer: {answer}")
+            # Create a Python object for the new quiz
+            new_quiz_entry = QuizHistory(
+                grammar_point=grammar_point,
+                question_text=question,
+                correct_answer=answer,
+                explanation=explanation
+            )
+
+            # Add the new object to the database
+            async with async_session_factory() as session:
+                session.add(new_quiz_entry)
+                await session.commit()
+
+            current_quiz = {
+                "question": question,
+                "reading": reading, # New field
+                "answer": answer,
+                "grammar_point": grammar_point,
+                "explanation": explanation
+            }
+            await channel.send(f"🧠 **New Japanese Quiz!**\n\n> {question}\n> {reading}\n\nType your answer in the chat to respond!")
+            print(f"Posted & saved new quiz. Grammar Point: {grammar_point}")
             
-            # On success, exit the function immediately.
-            return
+            return # Success!
 
         except Exception as e:
             print(f"Quiz generation attempt {attempt + 1} of {MAX_RETRIES} failed: {e}")
-            if attempt < MAX_RETRIES - 1:  # If this wasn't the last attempt
-                await asyncio.sleep(RETRY_DELAY) # Wait before retrying
-            else: # This was the last attempt, and all have failed.
-                print("All attempts to generate a quiz question failed. The task will try again in the next cycle.")
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(RETRY_DELAY)
+            else:
+                print("All quiz generation attempts failed. Will try again in the next cycle.")
 
 # --- BOT EVENTS AND COMMANDS ---
 @bot.event
 async def on_ready():
+    # Your original login message is perfectly fine
     print(f'Logged in as {bot.user.name}')
+    # This new check is critical. The task will fail without the database URL.
+    if not DATABASE_URL:
+        print("CRITICAL: DATABASE_URL is not set. Quiz task cannot start.")
+        return
+    # Your original check is good practice to prevent starting the task multiple times.
     if not post_quiz_question.is_running():
         post_quiz_question.start()
+        print("Quiz task has been started.")
 
 @bot.event
 async def on_message(message):
@@ -200,6 +279,7 @@ async def on_message(message):
             grading_prompt = QUIZ_GRADING_PROMPT.format(
                 question=current_quiz['question'],
                 correct_answer=current_quiz['answer'],
+                grammar_point=current_quiz['grammar_point'], # This line is new
                 user_answer=user_answer
             )
 
@@ -208,18 +288,18 @@ async def on_message(message):
                     loop = asyncio.get_running_loop()
                     response = await loop.run_in_executor(None, gemini_model.generate_content, grading_prompt)
                     await message.reply(response.text)
-                    current_quiz = {}
+                    current_quiz = {} # Reset the quiz after grading
                     print("Quiz graded and reset successfully.")
                     break
                 except Exception as e:
-                    print(f"Attempt {attempt + 1} of {MAX_RETRIES} failed: {e}")
+                    print(f"Grading attempt {attempt + 1} of {MAX_RETRIES} failed: {e}")
                     if attempt < MAX_RETRIES - 1:
                         await asyncio.sleep(RETRY_DELAY)
                     else:
-                        await message.reply("Sorry, I had trouble grading your answer due to a temporary issue. **Please feel free to submit your answer again!**")
+                        await message.reply("Sorry, I had trouble grading your answer due to a temporary issue. Please feel free to submit your answer again!")
         return
 
-    # --- Logic for the Commands Channel ---
+    # --- Logic for other channels (if any) ---
     if message.channel.id == ALLOWED_CHANNEL_ID:
         await bot.process_commands(message)
         return
