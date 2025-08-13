@@ -265,6 +265,17 @@ async def on_ready():
         print("Quiz task has been started.")
 
 @bot.event
+async def on_command_error(ctx, error):
+    """A global error handler for all commands."""
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"This command is on cooldown. Please try again in {error.retry_after:.1f} seconds.", delete_after=5)
+    elif isinstance(error, commands.CommandInvokeError):
+        print(f"In {ctx.command.name}: {error.original}")
+        await ctx.send("An unexpected error occurred while running this command.")
+    else:
+        print(f"An unhandled error occurred: {error}")
+
+@bot.event
 async def on_message(message):
     global current_quiz
     if message.author == bot.user:
@@ -338,6 +349,7 @@ async def check_japanese_sentence(ctx, *, sentence: str):
         except Exception as e:
             print(f"An error occurred: {e}")
             await ctx.send("Sorry, something went wrong. Please try again later.")
+            raise e
 
 @bot.command(name='grammar')
 async def explain_grammar(ctx, *, grammar_point: str):
@@ -373,7 +385,28 @@ async def explain_grammar(ctx, *, grammar_point: str):
         except Exception as e:
             print(f"An error occurred: {e}")
             await ctx.send("Sorry, something went wrong. Please try again later.")
+            raise e
 
 # --- START THE BOT ---
-keep_alive()
-bot.run(DISCORD_TOKEN)
+async def main():
+    """The main entry point for starting the bot."""
+    if not DISCORD_TOKEN:
+        print("CRITICAL: DISCORD_TOKEN is not set. The bot cannot start.")
+        return
+        
+    # Start the keep-alive server in a separate thread.
+    keep_alive()
+    
+    # Use an async context manager to handle the bot's lifecycle.
+    # This is more robust than a simple bot.run() call.
+    async with bot:
+        await bot.start(DISCORD_TOKEN)
+
+if __name__ == "__main__":
+    try:
+        # This is the modern, recommended way to run an asyncio program.
+        asyncio.run(main())
+    except discord.errors.LoginFailure:
+        print("Login failed: Improper token has been passed.")
+    except KeyboardInterrupt:
+        print("Bot is shutting down.")
